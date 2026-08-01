@@ -1,0 +1,25 @@
+# Only run.sh, solution.py, requirements.txt, mib_pipeline/ and models/ are
+# COPY'd; everything else is excluded to keep the build context small and to
+# make leaking local state or secrets into the image impossible.
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.git/
+.env
+.env.*
+*.env
+tools/
+!tools/offline_ocr_check.py
+# models/ holds the bundled PP-OCRv5 ONNX (det/rec/cls + rec_keys); it must
+# reach the image. Not excluded above, but kept explicit so a future broad
+# exclude never silently strips the offline fallback models.
+!models/
+runs/
+data/
+submission_draft/
+*.jsonl
+.DS_Store
+Dockerfile
+.dockerignore
+.gitignore

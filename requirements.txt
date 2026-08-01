@@ -1,0 +1,14 @@
+pymupdf==1.28.0
+pytesseract==0.3.13
+opencv-python-headless==5.0.0.93
+numpy==2.5.1
+pillow==12.3.0
+# fallback recognizer: the 1.4.4 wheel's runner loads ONNX models purely
+# offline (we point it at the bundled PP-OCRv5-mobile models under
+# models/ppocrv5 by local path). Pinned to 1.4.4 because newer unified
+# rapidocr releases download models at first run and die under --network none.
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.28.0
+pyclipper==1.4.0
+shapely==2.1.2
+six==1.17.0
