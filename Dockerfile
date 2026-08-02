@@ -36,7 +36,9 @@ ENV HOME=/tmp \
     TRANSFORMERS_OFFLINE=1 \
     MIB_RAPID_MODEL=v6 \
     MIB_REASON_ADJ=1 \
-    MIB_STAMP_RESCUE=1
+    MIB_STAMP_RESCUE=1 \
+    MIB_SNAPFIX=1 \
+    MIB_CTCFILL=1
 
 COPY run.sh solution.py /app/
 COPY mib_pipeline /app/mib_pipeline

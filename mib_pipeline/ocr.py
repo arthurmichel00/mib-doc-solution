@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -31,6 +32,13 @@ class OcrWord:
     conf: float               # 0..1
     line_key: tuple[int, int, int]
     x: float
+    # Full word box (same pixel space as the image the pass read). Both
+    # backends always report it; the defaults only keep old positional
+    # constructions (tests/fixtures) valid. Consumed by the MIB_CTCFILL
+    # label locator (ctcfill.py) — line assembly still keys on x alone.
+    y: float = 0.0
+    w: float = 0.0
+    h: float = 0.0
 
 
 class OcrEngine(Protocol):
@@ -44,36 +52,52 @@ class OcrEngine(Protocol):
 
 
 class PytesseractEngine:
-    """Development backend; shells out to the tesseract binary per call."""
+    """Development backend; shells out to the tesseract binary per call.
 
-    def __init__(self, psm: int = 6, sparse_psm: int = 11) -> None:
+    config_extra is appended verbatim to every call's config string (used
+    by the MIB_USERWORDS engine to pass --user-words/--user-patterns).
+    """
+
+    def __init__(self, psm: int = 6, sparse_psm: int = 11,
+                 config_extra: str = "") -> None:
         self._psm = psm
         self._sparse_psm = sparse_psm
+        self._config_extra = f" {config_extra}" if config_extra else ""
 
     def words(self, image: np.ndarray, sparse: bool = False) -> list[OcrWord]:
         import pytesseract
 
-        config = f"--oem 1 --psm {self._sparse_psm if sparse else self._psm}"
+        config = (f"--oem 1 --psm {self._sparse_psm if sparse else self._psm}"
+                  f"{self._config_extra}")
         data = pytesseract.image_to_data(
             image, config=config, output_type=pytesseract.Output.DICT
         )
         out = []
-        for text, conf, block, par, line, left in zip(
+        for text, conf, block, par, line, left, top, width, height in zip(
             data["text"], data["conf"], data["block_num"], data["par_num"],
-            data["line_num"], data["left"],
+            data["line_num"], data["left"], data["top"], data["width"],
+            data["height"],
         ):
             text = text.strip()
             conf = float(conf)
             if text and conf >= _MIN_WORD_CONF:
-                out.append(OcrWord(text, conf / 100.0, (block, par, line), float(left)))
+                out.append(OcrWord(text, conf / 100.0, (block, par, line),
+                                   float(left), float(top), float(width),
+                                   float(height)))
         return out
 
 
 class TesserocrEngine:
     """Docker backend; binds the tesseract C++ API so the model is loaded
-    once per worker process instead of spawning a subprocess per call."""
+    once per worker process instead of spawning a subprocess per call.
 
-    def __init__(self, psm: int = 6, sparse_psm: int = 11) -> None:
+    init_variables are handed to PyTessBaseAPI's `variables` kwarg, which
+    tesserocr applies DURING Init — required for init-only params such as
+    user_words_file/user_patterns_file (the MIB_USERWORDS engine).
+    """
+
+    def __init__(self, psm: int = 6, sparse_psm: int = 11,
+                 init_variables: dict[str, str] | None = None) -> None:
         import tesserocr
 
         self._tess = tesserocr
@@ -83,6 +107,8 @@ class TesserocrEngine:
         self._sparse_psm = sparse_psm
         path = os.environ.get("TESSDATA_PREFIX")
         kwargs = {"path": path} if path else {}
+        if init_variables:
+            kwargs["variables"] = dict(init_variables)
         self._api = tesserocr.PyTessBaseAPI(
             lang="eng", oem=tesserocr.OEM.LSTM_ONLY, psm=self._psm, **kwargs
         )
@@ -112,9 +138,14 @@ class TesserocrEngine:
                 continue
             conf = float(word.Confidence(ril.WORD))
             if text and conf >= _MIN_WORD_CONF:
-                bbox = word.BoundingBox(ril.WORD)
+                bbox = word.BoundingBox(ril.WORD)   # (x1, y1, x2, y2)
+                if bbox:
+                    x, y = float(bbox[0]), float(bbox[1])
+                    w, h = float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1])
+                else:
+                    x = y = w = h = 0.0
                 out.append(OcrWord(text, conf / 100.0, (block, par, line),
-                                   float(bbox[0]) if bbox else 0.0))
+                                   x, y, w, h))
         return out
 
 
@@ -364,6 +395,136 @@ def escalation_lines(gray: np.ndarray, page_index: int, variant: str,
     return lines
 
 
+# --- Vocabulary-constrained escalation pass (MIB_USERWORDS) -----------------
+# Every decision input the pipeline reads comes from a closed vocabulary
+# (vocab.py) printed after a fixed set of form labels. Tesseract's LSTM beam
+# search consults word dawgs, so loading those strings as user words biases
+# recognition on damaged rows toward exactly the tokens the downstream
+# matchers can consume — without touching a single matcher threshold. The
+# word list is built at import time from the closed sets; the dawg files are
+# written to tmpfiles once per process, on first use.
+
+# Form labels every template prints in front of its values.
+_USERWORDS_LABELS = (
+    "Home World", "Visa Class", "Sponsor ID", "Arrival Date",
+    "Declared Purpose", "Species Code", "Fee Status", "Observed Flags",
+    "FINDING", "Reason",
+)
+
+
+def _build_userwords() -> tuple[str, ...]:
+    """Ordered, de-duplicated word list from vocab.py's closed sets.
+
+    Tesseract user-words dawgs are word-level: multi-token phrases must be
+    split into their tokens. Species codes keep the printed underscore form
+    AND contribute their space-variant tokens (OCR reads both).
+    """
+    from . import vocab
+
+    words: dict[str, None] = {}          # insertion-ordered de-dupe
+
+    def add_tokens(phrase: str) -> None:
+        for token in str(phrase).split():
+            if token:
+                words.setdefault(token, None)
+
+    for code in vocab.SPECIES_CODES:
+        words.setdefault(code, None)     # printed underscore form
+        add_tokens(code.replace("_", " "))
+    for world in vocab.HOME_WORLDS:
+        add_tokens(world)
+    for cls in vocab.VISA_CLASSES:
+        words.setdefault(cls, None)
+    for purpose in vocab.PURPOSES:
+        add_tokens(purpose)
+    for status in vocab.FEE_STATUSES:
+        words.setdefault(status, None)
+    for label in _USERWORDS_LABELS:
+        add_tokens(label)
+    return tuple(words)
+
+
+USERWORDS = _build_userwords()
+
+# trie.cpp pattern syntax (\d = digit unichar): sponsor ids and ISO dates,
+# the two decision-bearing pattern-shaped values.
+USERPATTERNS = (r"SPN-\d\d\d\d", r"\d\d\d\d-\d\d-\d\d")
+
+_USERWORDS_PATH: str | None = None
+_USERPATTERNS_PATH: str | None = None
+
+
+def _dict_tmpfile(entries: tuple[str, ...], prefix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(entries) + "\n")
+    return path
+
+
+def userwords_path() -> str:
+    """Per-process user-words tmpfile (one word per line), written once."""
+    global _USERWORDS_PATH
+    if _USERWORDS_PATH is None:
+        _USERWORDS_PATH = _dict_tmpfile(USERWORDS, "mib_userwords_")
+    return _USERWORDS_PATH
+
+
+def userpatterns_path() -> str:
+    """Per-process user-patterns tmpfile, written once."""
+    global _USERPATTERNS_PATH
+    if _USERPATTERNS_PATH is None:
+        _USERPATTERNS_PATH = _dict_tmpfile(USERPATTERNS, "mib_userpatterns_")
+    return _USERPATTERNS_PATH
+
+
+_USERWORDS_ENGINE: OcrEngine | None = None
+
+
+def userwords_engine() -> OcrEngine:
+    """Per-process engine with the closed-vocabulary dictionaries loaded.
+
+    Same backend selection as default_engine. user_words_file /
+    user_patterns_file are init-only tesseract params, so this is a second
+    API instance, cached like the default one (verified in-container:
+    tesserocr 2.8.0 applies the `variables` kwarg during Init and tesseract
+    5.3's LSTM beam search consults the resulting dawgs).
+    """
+    global _USERWORDS_ENGINE
+    if _USERWORDS_ENGINE is None:
+        words, patterns = userwords_path(), userpatterns_path()
+        choice = os.environ.get("MIB_OCR_ENGINE", "auto")
+
+        def _pytess() -> PytesseractEngine:
+            return PytesseractEngine(
+                config_extra=f"--user-words {words} "
+                             f"--user-patterns {patterns}")
+
+        if choice == "pytesseract":
+            _USERWORDS_ENGINE = _pytess()
+        else:
+            try:
+                _USERWORDS_ENGINE = TesserocrEngine(init_variables={
+                    "user_words_file": words,
+                    "user_patterns_file": patterns,
+                })
+            except Exception:
+                if choice == "tesserocr":
+                    raise
+                _USERWORDS_ENGINE = _pytess()
+    return _USERWORDS_ENGINE
+
+
+def userwords_lines(gray: np.ndarray, page_index: int) -> list[Line]:
+    """ONE vocabulary-constrained pass over one escalation view.
+
+    Emitted lines are ordinary OCR lines: they rejoin the exact same
+    anchoring/vocabulary/reconciliation path as every escalation variant
+    and are protected by the same escalation restore guard (fill unread
+    fields only; an affirmative read is never out-voted).
+    """
+    return _words_to_lines(userwords_engine().words(gray), page_index)
+
+
 # --- Quarantined note-band re-read (MIB_NOTE_RESCUE) ------------------------
 # The adjudicator note prints its Finding/Reason rows in a fixed band at the
 # top of the page. render_gray rasterizes at 288 DPI — a 2x upsample of the
@@ -393,9 +554,13 @@ def note_band_lines(gray: np.ndarray, page_index: int,
                         interpolation=cv2.INTER_AREA)
     img = cv2.resize(native, None, fx=1.5, fy=1.5,
                      interpolation=cv2.INTER_CUBIC)
-    out = _words_to_lines(engine.words(img, sparse=True), page_index)
-    out.extend(_words_to_lines(engine.words(_divblur(img), sparse=True),
-                               page_index))
+    # The band is a raw crop, so its rows can touch the image edge, and
+    # tesseract 5.3 clips crop-edge glyphs (measured: 72.5 -> 94.3 word
+    # conf on MIB-001000's Reason line with the standard white pad).
+    out = _words_to_lines(engine.words(pad_for_ocr(img), sparse=True),
+                          page_index)
+    out.extend(_words_to_lines(engine.words(pad_for_ocr(_divblur(img)),
+                                            sparse=True), page_index))
     return out
 
 
@@ -654,6 +819,12 @@ class ScanOcrResult:
     # estimator scored k=0 highest). Metadata only — no ladder behavior
     # depends on it; the A2 rotation probe uses it as its trigger.
     orientation_estimated: bool = False
+    # Word boxes pooled from the ladder passes whose pixel space equals
+    # `gray` (raw/otsu/adaptive/stretch/sparse). Zero extra OCR cost — the
+    # passes already run; only their geometry was previously discarded.
+    # Deskewed/rotated/band-crop passes are excluded: their coordinates
+    # do not live in `gray`'s space. Consumed by the MIB_CTCFILL locator.
+    words: list[OcrWord] = None  # set in ocr_scan_page; None keeps old ctors
 
 
 def ocr_scan_page(gray: np.ndarray, page_index: int,
@@ -670,6 +841,9 @@ def ocr_scan_page(gray: np.ndarray, page_index: int,
     upright = True
     orientation_estimated = False
     pooled = _words_to_lines(raw_words, page_index)
+    # Geometry stash for MIB_CTCFILL: words from every pass that reads
+    # `gray`'s own pixel space (raw + the thresholded variants + sparse).
+    word_stash = list(raw_words)
 
     # Orientation handling is ADDITIVE (v1.2 lesson: replacing the base
     # image on an estimator's say-so poisons the whole ladder when the
@@ -694,8 +868,12 @@ def ocr_scan_page(gray: np.ndarray, page_index: int,
 
     otsu = _otsu(gray)
     for img in (otsu, _adaptive(gray), _otsu(_stretch(gray))):
-        pooled.extend(_words_to_lines(engine.words(img), page_index))
-    pooled.extend(_words_to_lines(engine.words(gray, sparse=True), page_index))
+        words = engine.words(img)
+        word_stash.extend(words)
+        pooled.extend(_words_to_lines(words, page_index))
+    sparse_words = engine.words(gray, sparse=True)
+    word_stash.extend(sparse_words)
+    pooled.extend(_words_to_lines(sparse_words, page_index))
 
     # Fine deskew is additive, never a replacement: a bad Hough estimate on
     # a decoy-line page must not poison the whole ladder.
@@ -743,4 +921,5 @@ def ocr_scan_page(gray: np.ndarray, page_index: int,
             best[key] = line
     return ScanOcrResult(lines=list(best.values()), gray=gray, upright=upright,
                          best_rot=0 if upright else best_rot,
-                         orientation_estimated=orientation_estimated)
+                         orientation_estimated=orientation_estimated,
+                         words=word_stash)

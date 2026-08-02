@@ -1,4 +1,0 @@
-{
-  "tests/test_fragment_realign.py::test_generator_handles_slight_common_slant_and_split_stamp_without_ocr": true,
-  "tests/test_fragment_realign.py::test_page_wrapper_chains_rule_anchors_inside_local_regions_with_page_coordinates": true
-}

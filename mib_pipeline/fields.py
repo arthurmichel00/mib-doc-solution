@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field as dc_field
 
 from . import vocab
@@ -135,6 +136,15 @@ _REASON_ADJ_MIN_COVER = 0.75
 
 def _reason_adj_enabled() -> bool:
     return os.environ.get("MIB_REASON_ADJ") == "1"
+
+
+def _jointname_enabled() -> bool:
+    """MIB_JOINTNAME=1 (default OFF): joint two-token decode of garbled
+    applicant names over the attested grammar (vocab.correct_name_joint;
+    moonshots idea, MIT — see ATTRIBUTION.md). Fires only after
+    correct_name failed to produce a legal two-token name, so reads the
+    base matcher already resolves are byte-identical with the flag on."""
+    return os.environ.get("MIB_JOINTNAME") == "1"
 # Fast gate before the quadratic matcher: a >= 78 read of a 15-21 char
 # phrase carries at most ~3 errors, which cannot destroy every 4-gram of
 # both the "FINDING:" prefix and the label word at once. Checked on a
@@ -393,6 +403,10 @@ def _correct(fld: str, raw: str) -> str | None:
         return vocab.repair_case_id(raw)
     if fld == "applicant_name":
         corrected = vocab.correct_name(raw)
+        if _jointname_enabled() and not vocab.is_grammar_name(corrected):
+            joint = vocab.correct_name_joint(raw)
+            if joint:
+                return joint
         return corrected if corrected else None
     if fld == "registry_status":
         return vocab.match_vocab(raw.upper(), ["CLEAR", "EMBARGO REVIEW"], 0.35)
@@ -844,7 +858,10 @@ def collect_candidates(
                 continue
             fld, _, raw = anchored
             if fld == "risk_flags":
-                flags, ok = vocab.parse_flags(raw)
+                # value side of a matched Observed-flags label: the ONLY
+                # place licensed for the truncation-prefix decode
+                # (vocab._truncated_flag, MIB_SNAPFIX=1; inert otherwise)
+                flags, ok = vocab.parse_flags(raw, flag_context=True)
                 flag_candidates.append(FlagsCandidate(
                     flags=frozenset(flags), parsed_ok=ok, tier=tier,
                     source=line.source, conf=line.conf,
@@ -1142,3 +1159,65 @@ def reconcile(
             _mine_reason_fields(ev)
 
     return ev
+
+
+# --- Cross-page per-digit sponsor vote (MIB_SNAPFIX=1; pipeline hook) -------
+# SPN-like read: fuzzy prefix (the degradation most often mangles the N —
+# it OCRs as H/M/R/U/W — and renders S as 5/$ and P as F; balawal
+# fuzzy.py snap_sponsor, MIT — see ATTRIBUTION.md) followed by a 4-char
+# group that may still carry letter-garbled digits. The group is repaired
+# per position (vocab._DIGIT_REPAIRS) and the vote decides the rest.
+_SPN_LIKE_RE = re.compile(
+    r"(?<![A-Za-z0-9])[S5$]\s*[PF]\s*[NMHRUW]\s*[-–—:.\s]*"
+    r"([0-9A-Za-z]{4})(?![0-9A-Za-z])"
+)
+
+
+def sponsor_digit_vote(pages: list[Page], case_id: str,
+                       guarded: frozenset[str] = frozenset()) -> str | None:
+    """ML decode of a sponsor id no single page could read, or None.
+
+    The generator prints one sponsor id on several pages and OCR digit
+    garbles are independent across pages, so a per-position majority over
+    near-agreeing SPN-like reads is the maximum-likelihood decode of the
+    fused digits (handemanai pipeline.py _sponsor_digit_vote, MIT — see
+    ATTRIBUTION.md). Pure post-parse: it only re-reads text already on
+    page.lines. The caller invokes it fill-only — sponsor_id currently
+    unread — so the worst case is the field staying unread.
+
+    Abstentions: fewer than two distinct pages carrying reads; any read
+    outside one Hamming-<=2 cluster (a second mention — decoy bait or a
+    different id — with no selected winner to anchor on, unlike the
+    reference); a tied or non-digit majority at any position; a revoked
+    id (`guarded`) anywhere in the cluster or as the result — the vote
+    must never move evidence toward or away from a deny trigger.
+    """
+    reads: set[tuple[int, str]] = set()
+    for page in pages:
+        if _foreign_page(page, case_id):
+            continue
+        for line in page.lines:
+            for m in _SPN_LIKE_RE.finditer(line.text):
+                group = m.group(1).translate(vocab._DIGIT_REPAIRS)
+                # junk fence: a genuine garbled id keeps most of its
+                # digits; an accidental prefix match on prose does not
+                if sum(ch.isdigit() for ch in group) >= 2:
+                    reads.add((page.index, group))
+    if len({index for index, _ in reads}) < 2:
+        return None
+    groups = [group for _, group in sorted(reads)]
+    if any(sum(x != y for x, y in zip(g, h)) > 2
+           for g in groups for h in groups):
+        return None
+    if any(f"SPN-{g}" in guarded for g in groups):
+        return None
+    voted = []
+    for i in range(4):
+        top = Counter(g[i] for g in groups).most_common(2)
+        if len(top) > 1 and top[0][1] == top[1][1]:
+            return None
+        if not top[0][0].isdigit():
+            return None
+        voted.append(top[0][0])
+    result = "SPN-" + "".join(voted)
+    return None if result in guarded else result

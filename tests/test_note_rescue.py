@@ -73,10 +73,12 @@ def _registry_page(index=0):
 class RecordingEngine:
     def __init__(self, canned=None):
         self.calls = []
+        self.images = []
         self._canned = list(canned or [])
 
     def words(self, image, sparse=False):
         self.calls.append((image.shape, sparse))
+        self.images.append(image)
         return self._canned.pop(0) if self._canned else []
 
 
@@ -92,12 +94,31 @@ class TestNoteBandLines:
         engine = RecordingEngine(canned=[words, []])
         lines = ocr.note_band_lines(gray, 2, engine)
         # band (30,350,20,560)pt * 4 = 1280x2160 px, downsampled 0.5 to
-        # native then upsampled 1.5: 960x1620. Two sparse passes (raw +
-        # divblur), nothing else.
-        assert engine.calls == [((960, 1620), True), ((960, 1620), True)]
+        # native then upsampled 1.5: 960x1620, plus pad_for_ocr's 30 px
+        # white border on every side (tesseract 5.3 clips crop-edge
+        # glyphs): 1020x1680. Two sparse passes (raw + divblur), nothing
+        # else.
+        assert engine.calls == [((1020, 1680), True), ((1020, 1680), True)]
         assert [l.text for l in lines] == ["Reesor packet"]
         assert lines[0].page_index == 2
         assert lines[0].source == Source.OCR
+
+    def test_both_band_reads_are_edge_padded(self):
+        """Both sparse reads (raw + divblur) see a white pad_for_ocr
+        border, so band content never touches the image edge — the
+        tesseract 5.3 crop-edge clipping that motivated the pad."""
+        gray = np.zeros((3168, 2448), np.uint8)    # all-ink band content
+        engine = RecordingEngine()
+        ocr.note_band_lines(gray, 0, engine)
+        assert len(engine.images) == 2
+        for img in engine.images:
+            assert img.shape == (960 + 60, 1620 + 60)
+            border = np.concatenate([img[:30].ravel(), img[-30:].ravel(),
+                                     img[:, :30].ravel(),
+                                     img[:, -30:].ravel()])
+            assert (border == 255).all()
+        # the raw view's interior is still the (dark) band content
+        assert (engine.images[0][30:-30, 30:-30] == 0).all()
 
     def test_empty_band_reads_nothing(self):
         engine = RecordingEngine()

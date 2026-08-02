@@ -13,8 +13,8 @@ import cv2
 import numpy as np
 import pymupdf
 
-from . import (crnn, decision, diagnostics, discharge, fields, ocr, policy,
-               stamp_rescue, vocab, writer)
+from . import (crnn, ctcfill, decision, diagnostics, discharge, fields, ocr,
+               policy, stamp_rescue, vocab, writer)
 from .calibration import clamp_confidence, path_stats
 from .fields import CaseEvidence
 from .model import PageKind
@@ -43,6 +43,14 @@ ROT_PROBE_DEFAULT = False
 # 2026-07-30 wall review (MIB-000051 faint-under-overlay class); same lazy
 # under-determined + soft-budget gating as the shipped variants.
 BGSUB_DEFAULT = False
+# USERWORDS: one extra vocabulary-constrained tesseract pass appended to
+# the escalation ladder tail (ocr.userwords_lines): the closed field
+# vocabularies + form labels load as tesseract user-words (and SPN-####/
+# ISO-date user-patterns), biasing the LSTM beam search on damaged rows
+# toward strings the matchers can actually consume. Same lazy
+# under-determined + soft-budget gating as the shipped variants; lines
+# rejoin the ordinary path and sit inside the same restore guard.
+USERWORDS_DEFAULT = False
 # NOTE_RESCUE: quarantined native-resolution re-read of the note header
 # band (ocr.note_band_lines) feeding ONLY the N1 reason-template probe
 # (fields.note_template_finding); rescue lines never join page.lines.
@@ -51,6 +59,25 @@ BGSUB_DEFAULT = False
 # no finding evidence of any kind; mints only via the MIB_REASON_ADJ=1
 # template channel, strictly below every positive decision.
 NOTE_RESCUE_DEFAULT = False
+# SNAPFIX: three text-level decode-repair mechanisms, no extra OCR pass —
+# fusion-bridged vocabulary snaps + the flag truncation-prefix (both in
+# vocab.py, consulted at match time) and the cross-page per-digit sponsor
+# vote (fields.sponsor_digit_vote, hooked below). One flag for all three.
+SNAPFIX_DEFAULT = False
+# CTCFILL: closed-menu CTC candidate scoring (ctcfill.py; mechanism from
+# the MIT-licensed moonshots solution, see ATTRIBUTION.md). Fires only on
+# decision-relevant menu fields (species/world/visa/purpose — NEVER fee,
+# NEVER sponsor) still unread after both engines and the whole escalation
+# ladder; label-anchored via the ladder's own word-box geometry; accepted
+# values are extraction-only fills, conf-capped below the affirmative-read
+# threshold so `known` stays False and no policy rule consumes them.
+CTCFILL_DEFAULT = False
+# JOINTNAME (MIB_JOINTNAME=1): joint two-token decode of garbled applicant
+# names over the attested name grammar. Lives entirely in fields.py /
+# vocab.py (same env-flag pattern as MIB_REASON_ADJ — matcher-level lever,
+# no pipeline plumbing); documented here so the lever inventory stays in
+# one place. Names carry zero classification signal, so it is
+# adjudication-inert by construction.
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -65,12 +92,21 @@ def _env_flag(name: str, default: bool) -> bool:
 # degrade to the calibrated fallback row, never stall a worker.
 CASE_DEADLINE_SECONDS = 180
 
+# Confidence carried by a sponsor id decoded by the cross-page digit vote:
+# the floor of an affirmatively-known OCR read (fields._KNOWN_MIN_OCR_CONF)
+# — a multi-page majority is at least as trustworthy as one 0.55 read.
+_KNOWN_MIN_OCR_CONF_VOTE = 0.55
+
 # Soft budget for the OPTIONAL escalation engines (rapid/variants/CRNN/weld):
 # past this, the case adjudicates with the evidence in hand. Prevents the
 # stacked engines from driving a heavy packet into the hard deadline, where
 # the fallback row would DISCARD already-won evidence (observed: 6 correct
 # note-verdict cases lost to FALLBACK_error on the first combined run).
 ESCALATION_SOFT_BUDGET_SECONDS = 70
+# The CTCFILL tail block's own allowance past the soft budget (seconds):
+# the ladder exhausts the budget on exactly the deep-damage packets the
+# lever targets, and the block costs 0.3-0.4 s measured.
+CTCFILL_ALLOWANCE = 5
 
 
 @contextmanager
@@ -233,6 +269,16 @@ def _esc_views_enabled() -> bool:
 
 def _note_rescue_enabled() -> bool:
     return _env_flag("MIB_NOTE_RESCUE", NOTE_RESCUE_DEFAULT)
+
+
+def _userwords_enabled() -> bool:
+    return _env_flag("MIB_USERWORDS", USERWORDS_DEFAULT)
+
+
+def _snapfix_enabled() -> bool:
+    return _env_flag("MIB_SNAPFIX", SNAPFIX_DEFAULT)
+def _ctcfill_enabled() -> bool:
+    return _env_flag("MIB_CTCFILL", CTCFILL_DEFAULT)
 
 
 def _strip_footer(text: str) -> str:
@@ -494,6 +540,32 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
                     evidence.flags.update(prev_flags)
             if not _under_determined(evidence) or not _budget_left():
                 break
+        # Vocabulary-constrained pass (MIB_USERWORDS=1, default OFF — flag
+        # unset keeps this block dead code): ONE extra tesseract pass per
+        # escalation view with the closed-vocabulary user-words/patterns
+        # dictionaries loaded (ocr.userwords_lines). Lines rejoin the exact
+        # same anchoring/vocabulary/reconciliation path as every escalation
+        # variant, and the block sits INSIDE the escalation restore guard
+        # below: it can fill still-unread inputs but never out-vote an
+        # affirmative pre-escalation read, and a pre-existing finding (or
+        # conflict) is restored over anything it mints.
+        if _userwords_enabled() and _under_determined(evidence) \
+                and _budget_left():
+            for index, result in scans.items():
+                if not _budget_left():
+                    break
+                extra = []
+                for view in _escalation_views(result, rot_probe.get(index)):
+                    extra.extend(ocr.userwords_lines(view, index))
+                if not extra:
+                    continue
+                best = {" ".join(l.text.lower().split()): l
+                        for l in sorted(pages[index].lines + extra,
+                                        key=lambda l: l.conf)}
+                pages[index].lines = list(best.values())
+            candidates, flag_candidates, findings = fields.collect_candidates(
+                pages, case_id)
+            evidence = fields.reconcile(candidates, flag_candidates, findings)
         # --- CRNN block (crnn-integrator; weld edits go elsewhere) ---
         # Candidate-trained CRNN, last of all engines: it only sees pages
         # everything else failed on, and its lines carry tier1_ok=False so
@@ -589,6 +661,41 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
         rescued = _note_rescue_candidate(pages, scans, engine, _budget_left)
         if rescued is not None:
             evidence.template_finding = rescued
+    # Closed-menu CTC fill (MIB_CTCFILL=1, default OFF — flag unset keeps
+    # this block dead code): for the decision-relevant menu fields STILL
+    # UNREAD after both engines, the whole escalation ladder AND its
+    # restore guard, score every legal menu value with the exact CTC
+    # forward against the PP-OCRv6 rec posteriors on label-anchored strips
+    # (ctcfill.py). Sits as a sibling of the escalation block — the ladder
+    # only triggers on _under_determined, which ignores species/purpose,
+    # yet those unread slots are exactly half the measured population.
+    # Fill-only BY CONSTRUCTION: touches only fields whose value is None
+    # here (so it can never out-vote any read, restored or otherwise),
+    # caps confidence below the affirmative-read threshold so `known`
+    # stays False and adjudication never consumes the value, and never
+    # emits fee_status, sponsor_id, findings or hard-embargo worlds.
+    # The block gets a small allowance ON TOP of the escalation soft
+    # budget: the ladder legitimately consumes the whole budget on
+    # exactly the deep-damage packets this lever exists for (native
+    # MIB-000016's ladder ends ~72 s), and the block's measured cost is
+    # 0.3-0.4 s against the 180 s hard deadline.
+    if scans and _ctcfill_enabled():
+        ctcfill_deadline = min(
+            started + ESCALATION_SOFT_BUDGET_SECONDS + CTCFILL_ALLOWANCE,
+            time.monotonic() + CTCFILL_ALLOWANCE)
+
+        def _ctcfill_left() -> bool:
+            return time.monotonic() < ctcfill_deadline
+
+        need = [f for f in ctcfill.FIELDS if evidence.value(f) is None]
+        if need and _ctcfill_left():
+            page_types = {i: pages[i].doc_type for i in scans}
+            for fld, (value, conf) in ctcfill.fill(
+                    scans, need, budget_left=_ctcfill_left,
+                    page_types=page_types).items():
+                if evidence.value(fld) is None:
+                    evidence.values[fld] = value
+                    evidence.conf[fld] = min(conf, ctcfill.CONF_CAP)
     # Name-challenge, AFTER the restore guard and for applicant_name only:
     # a grammar-valid CRNN name may replace a pre-known read ONLY when that
     # read fails the 12x24 name grammar (i.e. no engine produced a legal
@@ -608,6 +715,21 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
             conf, best_name = max(challengers)
             evidence.values["applicant_name"] = best_name
             evidence.conf["applicant_name"] = conf
+    # Cross-page per-digit sponsor vote (MIB_SNAPFIX=1, default OFF — flag
+    # unset keeps this block dead code): fill-only ML decode of a sponsor
+    # id no single page could read, from the SPN-like garbled reads already
+    # on page.lines (pure post-parse, no OCR pass). Runs after every
+    # engine and the restore guard, ONLY while the field is still unread,
+    # so it can never out-vote or flip an affirmative read. The revoked
+    # set is passed in so the vote abstains rather than mint or destroy an
+    # R4 deny trigger (guard proof in fields.sponsor_digit_vote).
+    if _snapfix_enabled() and evidence.value("sponsor_id") is None:
+        voted = fields.sponsor_digit_vote(
+            pages, case_id, guarded=frozenset(policy.REVOKED_SPONSORS))
+        if voted is not None:
+            evidence.values["sponsor_id"] = voted
+            evidence.known["sponsor_id"] = True
+            evidence.conf["sponsor_id"] = _KNOWN_MIN_OCR_CONF_VOTE
     # Hard-embargo home worlds carry the planetary_embargo flag in every
     # observed truth row (50/50 corpus-wide), whether or not the packet
     # prints it — inferring it recovers extraction on silent-flag packets.
