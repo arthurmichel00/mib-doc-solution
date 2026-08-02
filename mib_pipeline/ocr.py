@@ -364,6 +364,41 @@ def escalation_lines(gray: np.ndarray, page_index: int, variant: str,
     return lines
 
 
+# --- Quarantined note-band re-read (MIB_NOTE_RESCUE) ------------------------
+# The adjudicator note prints its Finding/Reason rows in a fixed band at the
+# top of the page. render_gray rasterizes at 288 DPI — a 2x upsample of the
+# 144 DPI embedded scan — and on a note's condensed micro-text the upsample's
+# ringing welds adjacent glyphs, so the Reason sentence reads ~30 points
+# below the template bars (diagnosed on MIB-001000). Resampling the band back
+# to native resolution and up to 1.5x restores the x-height Tesseract wants
+# without reopening the PDF.
+_NOTE_BAND_PT = (30, 350, 20, 560)      # top, bottom, left, right (points)
+
+
+def note_band_lines(gray: np.ndarray, page_index: int,
+                    engine: OcrEngine) -> list[Line]:
+    """Native-resolution sparse re-read of the note header band.
+
+    Callers MUST keep these lines quarantined: they exist solely for
+    fields.note_template_finding's N1-only probe and never join page.lines
+    or any other consumer.
+    """
+    s = RENDER_DPI / 72.0
+    t, b, l, r = _NOTE_BAND_PT
+    band = gray[int(t * s):int(b * s), int(l * s):int(r * s)]
+    if band.size == 0:
+        return []
+    band = np.ascontiguousarray(band)
+    native = cv2.resize(band, None, fx=0.5, fy=0.5,
+                        interpolation=cv2.INTER_AREA)
+    img = cv2.resize(native, None, fx=1.5, fy=1.5,
+                     interpolation=cv2.INTER_CUBIC)
+    out = _words_to_lines(engine.words(img, sparse=True), page_index)
+    out.extend(_words_to_lines(engine.words(_divblur(img), sparse=True),
+                               page_index))
+    return out
+
+
 # --- Cut-strip weld (sponsor-only) -----------------------------------------
 # Damage model identified by human review: the generator displaces rectangular
 # patches of page CONTENT — a text row is cut horizontally mid-glyph and the

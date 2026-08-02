@@ -46,7 +46,7 @@ modes, and red-team hardening are in `MEMO.md`.
 Flag-gated AI-agent loops, with verification in code rather than review. Every candidate lever was built
 behind a feature flag and A/B-measured on the full training set against five gates: score ≥ baseline,
 holdout ≥ train, a single designed-trap catastrophic false approval, zero fallback rows, and a green
-red-team corpus. More than thirty levers were built and measured; nine shipped enabled, and the kill reason
+red-team corpus. More than thirty levers were built and measured; ten shipped enabled, and the kill reason
 for every rejected one is recorded in [LEVERS.md](LEVERS.md). Humans entered at exactly three decision
 points: goal-setting, trust-boundary extensions, and ship calls. Evidence detail: [APPENDIX.md](APPENDIX.md).
 

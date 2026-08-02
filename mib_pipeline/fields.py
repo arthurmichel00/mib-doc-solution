@@ -258,6 +258,12 @@ def _finding_eligible(page: Page) -> bool:
     return not (_labels_on(page) & _ALL_DISTINCTIVE)
 
 
+# Public alias for the pipeline's note-band rescue gate: lets the caller
+# skip the band OCR entirely on pages that could never carry a trusted
+# Finding, without reaching into a private name.
+finding_eligible = _finding_eligible
+
+
 def detect_doc_type(page: Page) -> tuple[str | None, float]:
     """Identify the page's document type.
 
@@ -573,6 +579,70 @@ def _template_adjudication(page: Page) -> Finding | None:
                    template=canon)
 
 
+def note_template_finding(page: Page, lines: list[Line]) -> Finding | None:
+    """N1 template candidate from a QUARANTINED note-band re-read.
+
+    `lines` come from ocr.note_band_lines and must NEVER join page.lines:
+    scored through a probe page, they can produce a reason-template
+    adjudication candidate and nothing else — no field candidates, no N0
+    finding, no stamp pairing. Same gating as the ordinary N1 channel
+    (MIB_REASON_ADJ=1) and note-eligible pages only, so with the flag off
+    the probe is inert.
+    """
+    if not _reason_adj_enabled() or not _finding_eligible(page):
+        return None
+    probe = Page(index=page.index, kind=page.kind)
+    probe.lines = lines
+    probe.doc_type = page.doc_type
+    return _template_adjudication(probe)
+
+
+_ZONE_EDGE_RE = re.compile(r"^[^A-Z0-9_]+|[^A-Z0-9_]+$")
+
+
+def _truncation_guard_zone(upper: str, end: int, phrase_len: int) -> str:
+    """Junk-stripped label zone behind a fuzzy-phrase winner's window.
+
+    The winner's aligned window is extended through the alphanumeric run
+    it ends inside (a label word must never be cut mid-glyph-run), then
+    non-alphanumeric noise is stripped from both ends. On MIB-000497's
+    minting line "| FINDING: NEEDS 7. | |" the DENIED window is
+    "| FINDING: NEED"; extension + stripping yields "FINDING: NEEDS".
+    """
+    start = max(0, end - phrase_len)
+    while end < len(upper) and (upper[end].isalnum() or upper[end] == "_"):
+        end += 1
+    return _ZONE_EDGE_RE.sub("", upper[start:end])
+
+
+def _truncation_ambiguous(upper: str, end: int, label: str,
+                          phrase: str) -> bool:
+    """True when the winning label owes its win to trailing line junk.
+
+    Latent-bug mechanism (MIB-000497): damage truncates NEEDS_REVIEW to
+    the prefix "NEEDS" and appends junk ("| FINDING: NEEDS 7. | |").
+    Whole-line scoring charges the junk to BOTH labels, but the longer
+    competitor pays more — DENIED reads 80.0 while NEEDS_REVIEW collapses
+    to 66.7, and the 13.3 margin mints a spurious DENIED at 0.97. The
+    symmetric runner-up below was designed to credit a competitor for the
+    line being its prefix, but the junk destroys that credit too.
+
+    Guard: re-score every label on the junk-stripped label zone, where a
+    truncation-prefix regains its full credit (partial_ratio slides the
+    shorter string, so "FINDING: NEEDS" scores NEEDS_REVIEW at 100). The
+    winner must also win this scoring by the existing margin, else the
+    read is truncation-ambiguous and the line abstains. Unambiguous reads
+    win both scorings comfortably — no threshold or bar changes for them.
+    """
+    zone = _truncation_guard_zone(upper, end, len(phrase))
+    if not zone:
+        return False
+    zone_scores = {lab: vocab.partial_ratio(ph, zone)
+                   for lab, ph in _FINDING_PHRASES.items()}
+    zone_runner_up = max(v for lab, v in zone_scores.items() if lab != label)
+    return zone_scores[label] - zone_runner_up < _PHRASE_MIN_MARGIN
+
+
 def _fuzzy_phrase_finding(page: Page) -> Finding | None:
     """Recover a Finding whose printed line is garbled past the regex.
 
@@ -580,7 +650,8 @@ def _fuzzy_phrase_finding(page: Page) -> Finding | None:
     where `_parse_finding`'s literal "finding" token never surfaces.
     Accept only a whole-phrase read: the best label scores >= 78
     partial-ratio points AND >= 3 over the runner-up label AND the line
-    is long enough to cover the phrase. Two qualifying lines naming
+    is long enough to cover the phrase AND the win survives junk-stripped
+    re-scoring (truncation-prefix guard). Two qualifying lines naming
     different labels are a conflict, not a vote — abstain. Anything
     below threshold degrades to the current behavior (no finding).
     """
@@ -618,6 +689,8 @@ def _fuzzy_phrase_finding(page: Page) -> Finding | None:
                         for lab, other in _FINDING_PHRASES.items()
                         if lab != label)
         if score - runner_up < _PHRASE_MIN_MARGIN:
+            continue
+        if _truncation_ambiguous(upper, end, label, phrase):
             continue
         hits.append((score, line.conf, idx, label, text[end:].lstrip(" .,:;-")))
     if not hits or len({label for _, _, _, label, _ in hits}) > 1:

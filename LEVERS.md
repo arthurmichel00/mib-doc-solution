@@ -8,7 +8,7 @@ seed-8090 subset. Referenced from MEMO.md and APPENDIX.md.
 **Verdict keys.** `SHIPPED-GATED` in the tree behind a flag or decision · `SHIPPED-DORMANT` in the tree,
 default off · `REJECTED-ON-SAFETY` works, but harms clean cases or cannot be gated · `NO-GO-ON-VALUE`
 measured net-negative or net-zero · `DEAD-END` confirmed no headroom · `VERIFIED-SAFE` audited, no change
-needed · `STAGED` built and validated, deliberately not in the frozen image · `DEFERRED` post-submission
+needed · `SHIPPED-GATED (v2 build)` built and validated, deliberately not in the frozen image · `DEFERRED` post-submission
 queue. The shipped configuration itself is enumerated in MEMO.md and SUBMISSION.md.
 
 ## Shipped

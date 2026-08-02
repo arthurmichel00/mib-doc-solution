@@ -43,6 +43,14 @@ ROT_PROBE_DEFAULT = False
 # 2026-07-30 wall review (MIB-000051 faint-under-overlay class); same lazy
 # under-determined + soft-budget gating as the shipped variants.
 BGSUB_DEFAULT = False
+# NOTE_RESCUE: quarantined native-resolution re-read of the note header
+# band (ocr.note_band_lines) feeding ONLY the N1 reason-template probe
+# (fields.note_template_finding); rescue lines never join page.lines.
+# Recovers a destroyed note's Reason sentence that the 288-DPI 2x upsample
+# welds into unreadable micro-text (MIB-001000). Fires only on cases with
+# no finding evidence of any kind; mints only via the MIB_REASON_ADJ=1
+# template channel, strictly below every positive decision.
+NOTE_RESCUE_DEFAULT = False
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -223,6 +231,10 @@ def _esc_views_enabled() -> bool:
     return _env_flag("MIB_ESC_VIEWS", ESC_VIEWS_DEFAULT)
 
 
+def _note_rescue_enabled() -> bool:
+    return _env_flag("MIB_NOTE_RESCUE", NOTE_RESCUE_DEFAULT)
+
+
 def _strip_footer(text: str) -> str:
     text = _ROT_FOOTER_PHRASE_RE.sub(" ", text)
     kept = [
@@ -354,6 +366,36 @@ def _escalation_views(result, probe: _RotChoice | None = None) -> list[np.ndarra
         rot = np.ascontiguousarray(np.rot90(result.gray, k=k)) if k else result.gray
         views.append(ocr.pad_for_ocr(rot))
     return views
+
+
+def _note_rescue_candidate(pages, scans, engine: ocr.OcrEngine,
+                           budget_left) -> fields.Finding | None:
+    """Agreed N1 candidate from quarantined note-band re-reads, or None.
+
+    Each note-eligible scan page gets one native-resolution band re-read
+    (ocr.note_band_lines) fed to the N1-only probe
+    (fields.note_template_finding). The rescue lines are never attached to
+    page.lines or any other consumer, so this pass can mint a
+    reason-template candidate and nothing else. Two pages minting
+    different labels are definitionally under-determined (a genuine packet
+    carries exactly one adjudicator note): abstain outright.
+    """
+    candidate = None
+    for index in sorted(scans):
+        if not budget_left():
+            break
+        page = pages[index]
+        if not fields.finding_eligible(page):
+            continue
+        lines = ocr.note_band_lines(scans[index].gray, index, engine)
+        rescue = fields.note_template_finding(page, lines)
+        if rescue is None:
+            continue
+        if candidate is not None and rescue.label != candidate.label:
+            return None
+        if candidate is None or rescue.conf > candidate.conf:
+            candidate = rescue
+    return candidate
 
 
 def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
@@ -534,6 +576,19 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
         if pre.finding is not None or pre.finding_conflict:
             evidence.finding = pre.finding
             evidence.finding_conflict = pre.finding_conflict
+    # Quarantined note-band rescue (MIB_NOTE_RESCUE=1, default OFF — flag
+    # unset keeps this block dead code): when the case carries NO finding
+    # evidence of any kind, re-read each note-eligible scan page's header
+    # band at native resolution and let the N1-only probe mint a
+    # reason-template candidate. Consumed by policy strictly below every
+    # positive decision (the same template_finding channel as the ordinary
+    # MIB_REASON_ADJ path); disagreeing pages abstain inside the helper.
+    if (scans and _note_rescue_enabled() and evidence.finding is None
+            and not evidence.finding_conflict
+            and evidence.template_finding is None and _budget_left()):
+        rescued = _note_rescue_candidate(pages, scans, engine, _budget_left)
+        if rescued is not None:
+            evidence.template_finding = rescued
     # Name-challenge, AFTER the restore guard and for applicant_name only:
     # a grammar-valid CRNN name may replace a pre-known read ONLY when that
     # read fails the 12x24 name grammar (i.e. no engine produced a legal
