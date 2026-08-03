@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .venv/
+
+# Secrets must never enter this repo.
+.env
+.env.*
+*.env

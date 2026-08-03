@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 import pymupdf
 
+from . import row_restore
 from .model import Line, Page, Source
 from .visibility import redact_hidden_text
 
@@ -56,12 +57,21 @@ class PytesseractEngine:
 
     config_extra is appended verbatim to every call's config string (used
     by the MIB_USERWORDS engine to pass --user-words/--user-patterns).
+
+    lang/tessdata_dir select a non-default recognition model (the
+    MIB_TESSFT fine-tuned engine); both stay unset for the stock engine, so
+    the emitted tesseract command line is unchanged.
     """
 
     def __init__(self, psm: int = 6, sparse_psm: int = 11,
-                 config_extra: str = "") -> None:
+                 config_extra: str = "", lang: str | None = None,
+                 tessdata_dir: str | None = None) -> None:
         self._psm = psm
         self._sparse_psm = sparse_psm
+        self._lang = lang
+        if tessdata_dir:
+            config_extra = f'--tessdata-dir "{tessdata_dir}" {config_extra}'
+        config_extra = config_extra.strip()
         self._config_extra = f" {config_extra}" if config_extra else ""
 
     def words(self, image: np.ndarray, sparse: bool = False) -> list[OcrWord]:
@@ -69,8 +79,9 @@ class PytesseractEngine:
 
         config = (f"--oem 1 --psm {self._sparse_psm if sparse else self._psm}"
                   f"{self._config_extra}")
+        extra = {"lang": self._lang} if self._lang else {}
         data = pytesseract.image_to_data(
-            image, config=config, output_type=pytesseract.Output.DICT
+            image, config=config, output_type=pytesseract.Output.DICT, **extra
         )
         out = []
         for text, conf, block, par, line, left, top, width, height in zip(
@@ -94,10 +105,17 @@ class TesserocrEngine:
     init_variables are handed to PyTessBaseAPI's `variables` kwarg, which
     tesserocr applies DURING Init — required for init-only params such as
     user_words_file/user_patterns_file (the MIB_USERWORDS engine).
+
+    lang/path select a non-default recognition model: `path` is the
+    tessdata directory to resolve `<lang>.traineddata` in, overriding
+    TESSDATA_PREFIX (the MIB_TESSFT fine-tuned engine loads lang="mib" out
+    of models/tessdata). Both default to the stock eng model under
+    TESSDATA_PREFIX, so the stock engine's Init is unchanged.
     """
 
     def __init__(self, psm: int = 6, sparse_psm: int = 11,
-                 init_variables: dict[str, str] | None = None) -> None:
+                 init_variables: dict[str, str] | None = None,
+                 lang: str = "eng", path: str | None = None) -> None:
         import tesserocr
 
         self._tess = tesserocr
@@ -105,12 +123,12 @@ class TesserocrEngine:
         # is not supported, so keep the raw psm numbers.
         self._psm = psm
         self._sparse_psm = sparse_psm
-        path = os.environ.get("TESSDATA_PREFIX")
+        path = path or os.environ.get("TESSDATA_PREFIX")
         kwargs = {"path": path} if path else {}
         if init_variables:
             kwargs["variables"] = dict(init_variables)
         self._api = tesserocr.PyTessBaseAPI(
-            lang="eng", oem=tesserocr.OEM.LSTM_ONLY, psm=self._psm, **kwargs
+            lang=lang, oem=tesserocr.OEM.LSTM_ONLY, psm=self._psm, **kwargs
         )
 
     def words(self, image: np.ndarray, sparse: bool = False) -> list[OcrWord]:
@@ -525,6 +543,309 @@ def userwords_lines(gray: np.ndarray, page_index: int) -> list[Line]:
     return _words_to_lines(userwords_engine().words(gray), page_index)
 
 
+# --- Fine-tuned-font escalation pass (MIB_TESSFT) ---------------------------
+# A second tesseract LSTM whose recognizer was fine-tuned on the challenge
+# generator's own font (artifact by Shrey Shingala, MIT — see
+# ATTRIBUTION.md; held-out CER 9.59% -> 0.19% on that font). It is a real
+# recognizer, not a reconstruction, so its reads flow through the ordinary
+# pooling and confidence thresholds like any other engine's.
+#
+# It is NOT a corpus-wide second engine: the pass fires only from the
+# lazily-escalated tail in pipeline.py, on cases where both shipped engines
+# and the whole preprocessing ladder left a decision input unread.
+#
+# And within those cases it does not read PAGES, it reads label-anchored
+# VALUE STRIPS for the specific fields still unread (locator mechanism from
+# ctcfill.locate_strips, reusing the word-box geometry the ladder already
+# stashed — no new OCR pass to find them).
+#
+# That is the whole reason the lever is affordable. The arithmetic, against
+# a 6.00 s/PDF hard-DQ contract the build already sits at 5.81 under, i.e.
+# 0.19 s/PDF of headroom:
+#
+#   one fine-tuned pass over a full 288-DPI render  0.371 s (stock 0.185 s)
+#   escalation-eligible ceiling                     851/1000 packets
+#     (149 carry no scan page and can never fire)
+#   scan pages per scan-bearing packet              ~2.3
+#   => PAGE-level cost   0.851 x 2.3 x 0.371     =  ~0.73 s/PDF   4x headroom
+#
+#   fine-tuned pass over one located strip          0.0167-0.0200 s
+#   strips per escalated packet (measured)          1.35
+#   => STRIP-level cost  0.851 x ~0.023          =  ~0.020 s/PDF
+#
+# The strip figure holds at the CEILING of the trigger rate, so it does not
+# depend on estimating how often escalation actually fires — which is just
+# as well, since that is bounded below at 320/1000 (the unread-path
+# population) and estimated at 60-75% of scan-bearing packets, but was
+# never directly censused. A strip is ~1/50th of a page, and that ratio is
+# the lever.
+#
+# Strip anchoring is also the safety mechanism. The locator only emits a
+# strip when the field's printed LABEL was read at conf >= 0.60, so the
+# crop provably contains generator text — the model is never handed the
+# blank/noisy regions where (see below) it hallucinates confidently.
+#
+# NOT A REPEAT OF MIB_USERWORDS (ledgered NO-SHIP at -0.22, research/
+# LEDGER.md:392-399, whose anti-repeat reads "user-words/user-patterns on
+# the escalation ladder measured NET-NEGATIVE; do not revisit without a
+# different integration design"). That lever biased a general recognizer's
+# DECODER toward the closed vocabulary, and its own post-mortem named the
+# mechanism: "vocab-biased decoding corrupts reads" — extraction fell 45.30
+# -> 45.18. This lever changes the MODEL, not the decode: a second LSTM
+# whose weights were fit to the glyph shapes, with no vocabulary prior
+# imposed at all. The two differ in what they are allowed to get wrong. A
+# vocabulary prior can only pull a read TOWARD a legal string, so when it
+# is wrong it is wrong in exactly the direction the matchers cannot catch;
+# a recognizer that misreads a glyph produces a string the matchers reject.
+# The shared failure mode is nonetheless real and is what the strip-level
+# tests guard: on a CLEAN row the fine-tuned pass must not out-vote a
+# correct stock read. Pooling keeps the stock line, the restore guard puts
+# affirmative reads back, and the 0.75 scale caps what an invented read can
+# claim.
+#
+# Two further inherited cautions from that post-mortem, both for the A/B to
+# adjudicate rather than anything native measurement can settle:
+#   - Its 8 changed rows clustered in the corpus tail and were attributed
+#     to an extra pass perturbing per-worker tesseract state, i.e. an extra
+#     pass can move cases it never targeted. This pass runs on its own
+#     PyTessBaseAPI instance under OEM.LSTM_ONLY, which should not share
+#     adaptive state, but "should not" is a hypothesis; the corpus A/B is
+#     what tests it.
+#   - Its capability was verified in-image and it still lost. Passing a
+#     test battery predicts nothing about the score.
+#
+# CONFOUND worth naming before anyone credits the fine-tuning. The
+# artifact's version string is
+# "4.00.00alpha:eng:synth20170629:[...Lfx512...]" — it is a fine-tune of
+# tessdata_best eng (the FLOAT model), whereas our stock engine is the
+# int-quantized Lfx192 build of that same lineage. So any quality gap
+# measured here has two candidate causes, the font fine-tuning and the
+# bigger/unquantized base, and this work does not separate them. If the
+# A/B pays, the cheap follow-up is to run plain tessdata_best eng as the
+# second engine: same ~2x cost, no third-party artifact, and it would say
+# how much of the gain the fine-tuning is actually responsible for.
+#
+# Measured yield is NOT yet proven, and the strip design is the reason to
+# be suspicious: requiring a confident label biases the located strips
+# toward rows the stock engine already reads. On 60 escalation-population
+# packets / 61 strips the two engines agreed on almost everything, with 2
+# label recoveries for the fine-tuned model ("Sponsor 1D" -> "Sponsor ID",
+# same value both ways) against 1 regression ("Visa Class" -> "Via
+# Class") — a wash at that sample size, and zero value-level recoveries.
+# Two caveats cut the other way: those runs approximated the word stash
+# with ONE stock pass instead of the ladder's five, so the real locator
+# sees more labels, and they sampled cases the ladder had NOT yet failed
+# on, which is an easier population than the one this pass actually meets.
+# Treat the cost numbers as measured and the benefit as an open question
+# for the A/B — that is what the flag is for.
+#
+# FIT/SERVE: every number in this comment was measured natively (host
+# tesseract 5.5.1) and the image runs tesseract 5.3.4, a gap documented
+# five times in this project and sign-mixed each time — the note-band
+# rescue mints under 5.5 and not under 5.3, while MIB-001000 reads under
+# 5.3 and not under 5.5. So treat the figures below as DIRECTION, not as
+# evidence about the image; the in-container A/B is the only arbiter.
+# One 5.3-specific mechanism is already handled rather than hoped about:
+# 5.3 clips glyphs touching a crop edge (measured 72.5 -> 94.3 word conf on
+# the note band from padding alone), and every strip this pass reads is a
+# raw crop, so tessft_lines runs pad_for_ocr on all of them.
+#
+# Conf scale, measured on 8 train packets / 14 scan pages (2026-08-03):
+#
+#   Genuine reads are NOT inflated. Over 409 words where both engines
+#   returned the same string in the same box, mean conf was 92.68 stock vs
+#   91.96 fine-tuned (mean ratio 1.0006, median 1.0000, fine-tuned higher
+#   on 50.1% — a coin flip). So this is NOT a miscalibrated engine and the
+#   scale is not a calibration correction.
+#
+#   What IS shifted is hallucination on content holding no generator text
+#   at all. On textureless noise strips the fine-tuned model invents 1.75x
+#   to 7x more words than stock, at materially higher confidence: stock
+#   emitted nothing at sigma=45 and peaked at 50.55 elsewhere, while the
+#   fine-tuned model emitted 7-13 words peaking at 63.57 / 67.67 / 73.20.
+#   That is the font fit working against us — it is trained to see this
+#   font, so paper grain resolves into confident glyphs.
+#
+#   Stock's junk therefore cannot reach fields._KNOWN_MIN_OCR_CONF (0.55)
+#   and the fine-tuned model's can, which is the whole exposure: an
+#   invented read crossing the affirmative-read line could mint a value on
+#   a decision field that was unread — exactly the field this pass targets.
+#   The scale is sized to close precisely that gap: 0.55 / 0.7320 = 0.7514,
+#   so 0.75 puts the worst observed hallucination at 54.9, just under the
+#   line, while the average genuine read (92.0) lands at 69.0 and stays
+#   comfortably affirmative. Reads still pool and vote normally; they just
+#   cannot out-vote a stock engine on invented evidence.
+TESSFT_LANG = "mib"
+_TESSFT_CONF_SCALE = 0.75
+
+_TESSFT_ENGINE: OcrEngine | None = None
+_TESSFT_UNAVAILABLE = False
+
+
+def tessft_dir() -> Path:
+    """Directory holding <TESSFT_LANG>.traineddata (COPYed to /app/models)."""
+    override = os.environ.get("MIB_TESSFT_DIR")
+    return Path(override) if override else _models_dir() / "tessdata"
+
+
+def tessft_engine() -> OcrEngine | None:
+    """Per-process engine bound to the fine-tuned traineddata, or None.
+
+    Returns None (warning once) when the artifact or a working backend is
+    absent rather than raising: the pass is an optional escalation engine
+    and a missing model must degrade to "no extra pass", never break a
+    case. Warning rather than silent, because a model that quietly stops
+    loading in the image would look exactly like a lever that stopped
+    paying (the failure mode called out in the source project's own
+    Dockerfile).
+    """
+    global _TESSFT_ENGINE, _TESSFT_UNAVAILABLE
+    if _TESSFT_ENGINE is None and not _TESSFT_UNAVAILABLE:
+        directory = tessft_dir()
+        model = directory / f"{TESSFT_LANG}.traineddata"
+        if not model.is_file():
+            _warn_tessft(f"fine-tuned model not found at {model}")
+            return None
+        choice = os.environ.get("MIB_OCR_ENGINE", "auto")
+
+        def _pytess() -> PytesseractEngine:
+            return PytesseractEngine(lang=TESSFT_LANG,
+                                     tessdata_dir=str(directory))
+
+        try:
+            if choice == "pytesseract":
+                _TESSFT_ENGINE = _pytess()
+            else:
+                try:
+                    _TESSFT_ENGINE = TesserocrEngine(lang=TESSFT_LANG,
+                                                     path=str(directory))
+                except Exception:
+                    if choice == "tesserocr":
+                        raise
+                    _TESSFT_ENGINE = _pytess()
+        except Exception as exc:                     # pragma: no cover
+            _warn_tessft(f"fine-tuned engine failed to load: {exc!r}")
+            return None
+    return _TESSFT_ENGINE
+
+
+def _warn_tessft(message: str) -> None:
+    global _TESSFT_UNAVAILABLE
+    import sys
+
+    _TESSFT_UNAVAILABLE = True
+    print(f"[mib] MIB_TESSFT disabled: {message}", file=sys.stderr)
+
+
+# Printed label token runs anchoring the value strip of each field the
+# escalation gate (pipeline._under_determined) can be waiting on. Matched
+# case-insensitively after punctuation stripping, like ctcfill's locator.
+TESSFT_LABELS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "fee_status": (("Fee", "Status"),),
+    "visa_class": (("Visa", "Class"),),
+    "home_world": (("Home", "World"),),
+    "sponsor_id": (("Sponsor", "ID"),),
+    "arrival_date": (("Arrival", "Date"),),
+    "risk_flags": (("Observed", "flags"),),
+}
+
+# Locator gates, mirroring ctcfill's (which were calibrated on the
+# menu-sweep population): every label token needs this confidence, the
+# value region runs this far right of the label's left edge, and each row
+# gets this much vertical padding. _TESSFT_MAX_STRIPS bounds the per-page
+# work so a page whose labels re-read many times cannot blow the budget.
+_TESSFT_LOC_MIN_CONF = 0.60
+_TESSFT_STRIP_W = 680
+_TESSFT_STRIP_Y_PAD = 6
+_TESSFT_MAX_STRIPS = 6
+
+
+def tessft_strips(result: "ScanOcrResult",
+                  wanted: tuple[str, ...]) -> list[np.ndarray]:
+    """Label-anchored value strips for the still-unread fields of one page.
+
+    Reads ScanOcrResult.words — geometry the ladder already produced — so
+    locating costs no OCR. A label token run must match exactly after
+    punctuation stripping, sit on one row reading left-to-right, and carry
+    conf >= _TESSFT_LOC_MIN_CONF. Rows are deduped across fields (one strip
+    is read once even if two labels resolve to it). Empty list = abstain;
+    there is deliberately no full-page fallback search.
+
+    Consequence worth knowing: the stash is read on the UNROTATED render,
+    so a page with baked-in rotation yields no confident label run and this
+    pass abstains on it entirely. That is the intended trade — the rotation
+    families are the escalation ladder's and the A2 probe's job, and a
+    fallback search over rotated views would cost exactly the per-page time
+    this design exists to avoid.
+    """
+    words = result.words or []
+    if not words:
+        return []
+    gray = result.gray
+    hits: dict[int, tuple[float, tuple[int, int, int, int]]] = {}
+    for field in wanted:
+        for pattern in TESSFT_LABELS.get(field, ()):
+            n = len(pattern)
+            for i in range(len(words) - n + 1):
+                run = words[i:i + n]
+                if any(w.h <= 0 or w.w <= 0 for w in run):
+                    continue        # legacy stash without geometry
+                if any(_clean_label_token(w.text) != t.lower()
+                       for w, t in zip(run, pattern)):
+                    continue
+                if any(w.conf < _TESSFT_LOC_MIN_CONF for w in run):
+                    continue
+                ys = [w.y for w in run]
+                if max(ys) - min(ys) > max(w.h for w in run):
+                    continue        # not one row
+                if not all(a.x + a.w * 0.5 < b.x < a.x + a.w + 3.0 * a.h
+                           for a, b in zip(run, run[1:])):
+                    continue
+                y0 = int(max(0, min(ys) - _TESSFT_STRIP_Y_PAD))
+                y1 = int(min(gray.shape[0],
+                             max(w.y + w.h for w in run) + _TESSFT_STRIP_Y_PAD))
+                x0 = int(max(0, run[0].x - 2))
+                x1 = int(min(gray.shape[1], run[0].x + _TESSFT_STRIP_W))
+                if y1 - y0 < 8 or x1 - x0 < 60:
+                    continue
+                key = (y0 + y1) // 24        # dedupe re-reads of one row
+                conf = min(w.conf for w in run)
+                held = hits.get(key)
+                if held is None or conf > held[0]:
+                    hits[key] = (conf, (y0, y1, x0, x1))
+    return [np.ascontiguousarray(gray[y0:y1, x0:x1])
+            for _, (y0, y1, x0, x1) in
+            sorted(hits.values(), key=lambda h: -h[0])[:_TESSFT_MAX_STRIPS]]
+
+
+def _clean_label_token(text: str) -> str:
+    return text.strip().strip("|:;.,'\"`!‘’“”[](){}").lower()
+
+
+def tessft_lines(result: "ScanOcrResult", page_index: int,
+                 wanted: tuple[str, ...]) -> list[Line]:
+    """Fine-tuned-model reads of one page's unread-field value strips.
+
+    Emitted lines are ordinary OCR lines carrying scaled confidences: they
+    rejoin the exact same anchoring/vocabulary/reconciliation path as every
+    escalation variant and sit inside the same escalation restore guard
+    (fill unread fields only; an affirmative read is never out-voted).
+    Each strip keeps its label, so the lines read "Fee Status: paid" —
+    exactly the shape the anchor matchers already consume.
+    """
+    engine = tessft_engine()
+    if engine is None:
+        return []
+    lines: list[Line] = []
+    for strip in tessft_strips(result, wanted):
+        # Strips are raw crops whose glyphs can touch the edge, which
+        # tesseract clips (the note-band lever measured 72.5 -> 94.3 word
+        # conf from the white pad alone).
+        lines.extend(_words_to_lines(engine.words(pad_for_ocr(strip)),
+                                     page_index))
+    return [replace(l, conf=l.conf * _TESSFT_CONF_SCALE) for l in lines]
+
+
 # --- Quarantined note-band re-read (MIB_NOTE_RESCUE) ------------------------
 # The adjudicator note prints its Finding/Reason rows in a fixed band at the
 # top of the page. render_gray rasterizes at 288 DPI — a 2x upsample of the
@@ -699,6 +1020,54 @@ def weld_sponsor_lines(gray: np.ndarray, page_index: int,
     return lines
 
 
+# --- Frame-fiducial row registration (MIB_ROWRESTORE) -----------------------
+# One extra pooled ladder pass over a geometry-repaired crop, on the scan
+# pages that carry a measured horizontal band translation. Every other
+# ladder pass is photometric (threshold, contrast, upsample) and none of
+# them can read a row whose glyphs were cut and slid sideways; row_restore
+# puts the strip back on the form's own frame baseline. See row_restore.py
+# for the mechanism and ATTRIBUTION.md for its source.
+
+# Reconstructed geometry is never allowed to carry an affirmative read.
+# Same cap and same reason as weld_sponsor_lines: a remap is a hypothesis
+# about where the ink belonged, and adjudication must not rest on one.
+# Measured on train renders (see the lever's analysis): a registered band
+# on MIB-000057 p2 turned a correct `Code ORION_GRAYS` at 0.73 into
+# `Code: ORIOH_GRAYS` at 0.84 — uncapped, the corruption outranks the
+# truth in the pool. Capped below fields._KNOWN_MIN_OCR_CONF it can fill
+# an unread field and nothing else.
+_ROWRESTORE_CONF_CAP = 0.50
+
+
+def row_restore_lines(gray: np.ndarray, page_index: int, engine: OcrEngine,
+                      dpi: float = RENDER_DPI) -> list[Line]:
+    """Read the frame-registered band, or nothing when the page is clean.
+
+    The gate lives in row_restore.restored_band: an undamaged page pays a
+    strided frame trace and returns here empty, having run no OCR at all.
+    Only the displaced band is re-read, not the page — the crop keeps the
+    cost proportional to the damage. Emitted lines rejoin the same
+    pooling/anchoring/vocabulary path as every other ladder pass, at
+    capped confidence.
+    """
+    reg = row_restore.register(gray, dpi)
+    if reg is None:
+        return []
+    top = min(b.top for b in reg.repaired)
+    bottom = max(b.bottom for b in reg.repaired)
+    margin = max(8, int(dpi / 4))
+    crop = reg.image[max(0, top - margin):min(gray.shape[0], bottom + margin)]
+    if crop.size == 0:
+        return []
+    # Crop rows can touch the image edge, where tesseract 5.3 clips glyphs
+    # (the same white-pad fix note_band_lines needed).
+    img = pad_for_ocr(np.ascontiguousarray(crop))
+    lines = _words_to_lines(engine.words(img), page_index)
+    lines.extend(_words_to_lines(engine.words(img, sparse=True), page_index))
+    return [Line(text=l.text, page_index=l.page_index, source=l.source,
+                 conf=min(l.conf, _ROWRESTORE_CONF_CAP)) for l in lines]
+
+
 def _remove_ruled_lines(bw: np.ndarray) -> np.ndarray:
     """Erase the notebook ruling that fragments OCR on table-style scans."""
     inverted = cv2.bitwise_not(bw)
@@ -811,7 +1180,14 @@ def _looks_readable(words: list[OcrWord]) -> bool:
 @dataclass
 class ScanOcrResult:
     lines: list[Line]
-    gray: np.ndarray          # orientation-fixed, deskewed render
+    # The RAW render this page was read from, exactly as passed in. It is
+    # NOT deskewed and NOT orientation-corrected: ocr_scan_page's rotation
+    # and deskew work is ADDITIVE (extra OCR passes over transformed
+    # copies, pooled into `lines`) and never replaces this image. Consumers
+    # that do their own geometry — ctcfill's grid locator, absynth's
+    # registration — must straighten it themselves. `upright` / `best_rot`
+    # below report what the estimator believed, not what was applied here.
+    gray: np.ndarray
     upright: bool             # False when a 90/180/270 rotation was applied
     best_rot: int = 0         # estimated np.rot90 k for non-upright pages
     # True when the upright pass did not read as a known template and the
@@ -913,6 +1289,21 @@ def ocr_scan_page(gray: np.ndarray, page_index: int,
                                  interpolation=cv2.INTER_LANCZOS4)
                 pooled.extend(_words_to_lines(engine.words(_otsu(big)),
                                               page_index))
+
+    # Free-form re-read of the registered band (MIB_ROWRESTORE_FREEFORM=1,
+    # default OFF and MEASURED NO-SHIP — see row_restore.FREEFORM_DEFAULT.
+    # MIB_ROWRESTORE alone does NOT reach here: the shipped channel reads
+    # the registered page with the closed-menu CTC scorer instead, so the
+    # arm never pays this block's ~204 ms per triggered page).
+    # Upright pages only: the fiducial is the form's LEFT frame rule, which
+    # is only on the left when the page is the right way up, and the
+    # counter-rotated views are already pooled above. Additive like every
+    # other pass — the restored crop's lines join `pooled` and win a line
+    # only by out-confidencing it, never by replacing a read.
+    # Word geometry is deliberately NOT stashed: the crop's coordinates do
+    # not live in `gray`'s pixel space (same exclusion as the band passes).
+    if row_restore.freeform_enabled() and upright:
+        pooled.extend(row_restore_lines(gray, page_index, engine))
 
     best: dict[str, Line] = {}
     for line in pooled:

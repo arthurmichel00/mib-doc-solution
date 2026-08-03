@@ -38,9 +38,12 @@ ENV HOME=/tmp \
     MIB_REASON_ADJ=1 \
     MIB_STAMP_RESCUE=1 \
     MIB_SNAPFIX=1 \
-    MIB_CTCFILL=1
+    MIB_CTCFILL=1 \
+    MIB_ABSYNTH=1 \
+    MIB_CTCFILL_FUSION=1 \
+    MIB_TESSFT=1
 
-COPY run.sh solution.py /app/
+COPY run.sh solution.py THIRD_PARTY_NOTICES.md /app/
 COPY mib_pipeline /app/mib_pipeline
 COPY models /app/models
 COPY tools/offline_ocr_check.py /app/tools/offline_ocr_check.py

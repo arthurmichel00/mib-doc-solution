@@ -13,8 +13,8 @@ import cv2
 import numpy as np
 import pymupdf
 
-from . import (crnn, ctcfill, decision, diagnostics, discharge, fields, ocr,
-               policy, stamp_rescue, vocab, writer)
+from . import (absynth, crnn, ctcfill, decision, diagnostics, discharge,
+               fields, ocr, policy, row_restore, stamp_rescue, vocab, writer)
 from .calibration import clamp_confidence, path_stats
 from .fields import CaseEvidence
 from .model import PageKind
@@ -51,6 +51,18 @@ BGSUB_DEFAULT = False
 # under-determined + soft-budget gating as the shipped variants; lines
 # rejoin the ordinary path and sit inside the same restore guard.
 USERWORDS_DEFAULT = False
+# TESSFT: a SECOND tesseract LSTM whose recognizer was fine-tuned on the
+# challenge generator's own font (ocr.tessft_lines; MIT artifact by Shrey
+# Shingala, see ATTRIBUTION.md). Deliberately NOT a corpus-wide second
+# engine — that costs +1.26 s/PDF in the source project, and ~0.30 s/PDF
+# here. It joins the same lazily-escalated tail as the variants above, so
+# it only runs where both shipped engines and the whole preprocessing
+# ladder left a decision input unread; and there it re-reads only the
+# label-anchored value STRIPS of those unread fields, never whole pages
+# (measured 0.0226 s per escalated case). Reads are additive and pooled by
+# confidence, never replacements, and the block sits inside the escalation
+# restore guard.
+TESSFT_DEFAULT = False
 # NOTE_RESCUE: quarantined native-resolution re-read of the note header
 # band (ocr.note_band_lines) feeding ONLY the N1 reason-template probe
 # (fields.note_template_finding); rescue lines never join page.lines.
@@ -72,6 +84,45 @@ SNAPFIX_DEFAULT = False
 # values are extraction-only fills, conf-capped below the affirmative-read
 # threshold so `known` stays False and no policy rule consumes them.
 CTCFILL_DEFAULT = False
+# ROWRESTORE (MIB_ROWRESTORE=1): closes our deferred frame-anchored
+# slice-shift lever. Ours end to end — the strip-realignment concept
+# (Arthur, 2026-07-28) became lever W1, our Batch B battery rejected it
+# because the CONTENT-BASED detector fired on 20/30 clean pages at
+# 120-600 s/page, and the frame-as-ruler gate that unblocks it is Arthur's
+# too (2026-07-30, "the strongest seams are the left and right border
+# lines"). Implementation original, written to our own two-rail spec; the
+# public MIT solutions that independently confirmed the approach are
+# credited in ATTRIBUTION.md as a courtesy, not as a licence obligation.
+# Shipped substance: frame-anchored gate + repair +
+# constrained closed-menu re-read through our own CTC channel. The gate
+# and remap live in row_restore.py; the read is ctcfill.fill_restored
+# under the UNCHANGED ctcfill contract (fill-only, CONF_CAP, no hard-
+# embargo world, no mode default, never fee_status or sponsor_id), hooked
+# in the block below as a sibling of the CTCFILL block and independent of
+# its flag. Displacement-gated: a page with no measured band translation
+# costs one strided frame trace and never reaches the recognizer.
+# The first integration fed the registered crop to a free-form tesseract
+# pass pooled into the ladder; that measured NO-SHIP (no field recovered,
+# one correct read corrupted, ~204 ms/trigger) and now sits behind its own
+# dead flag MIB_ROWRESTORE_FREEFORM — MIB_ROWRESTORE does not enable it.
+# ABSYNTH: generator-inversion menu reader (absynth.py; mechanism from the
+# MIT-licensed luke-harriman solution, see ATTRIBUTION.md). The LAST
+# resort, sitting behind CTCFILL: on the same four closed menus, for slots
+# still unread after ctcfill too, it re-renders each candidate on the
+# generator's exact raster grid, degrades it with a kernel recovered from
+# the row's own known label, and picks by NCC — no recognizer is involved,
+# which is why it can still separate candidates on strips whose CTC
+# posteriors are noise. Same fill-only, conf-capped, embargo-free,
+# never-the-mode-default contract as CTCFILL.
+ABSYNTH_DEFAULT = False
+# XCHANNEL_VETO: cross-channel veto (absynth.veto). Independent of
+# MIB_ABSYNTH. When CTCFILL emits a menu fill, the pixel channel re-scores
+# the SAME menu on the SAME row; if it is confident and decisively
+# disagrees, the fill is WITHDRAWN (field returns to unread, hence to the
+# writer's default). It can only ever delete a fill, never write one —
+# a vetoed field is also withheld from the ABSYNTH block below, so the
+# veto cannot become a back-door substitution of this channel's own answer.
+XCHANNEL_VETO_DEFAULT = False
 # JOINTNAME (MIB_JOINTNAME=1): joint two-token decode of garbled applicant
 # names over the attested name grammar. Lives entirely in fields.py /
 # vocab.py (same env-flag pattern as MIB_REASON_ADJ — matcher-level lever,
@@ -107,6 +158,17 @@ ESCALATION_SOFT_BUDGET_SECONDS = 70
 # the ladder exhausts the budget on exactly the deep-damage packets the
 # lever targets, and the block costs 0.3-0.4 s measured.
 CTCFILL_ALLOWANCE = 5
+# The frame-registered channel's own allowance, same shape and reason as
+# CTCFILL_ALLOWANCE: it fires on the deep-damage packets that already
+# exhausted the escalation budget, and its cost is the gate plus rec
+# inference on the band's located strips.
+ROWRESTORE_ALLOWANCE = 5
+# The ABSYNTH tail block's own allowance, on the same reasoning as
+# CTCFILL's: it fires on packets whose ladder has already spent the soft
+# budget. Sized from the measured per-page cost (0.30 s for a registered
+# page with all four fields attempted) times the 4-page cap, so the block
+# cannot exceed its allowance even when every page registers.
+ABSYNTH_ALLOWANCE = 3
 
 
 @contextmanager
@@ -162,17 +224,34 @@ def process_pdf(pdf_path: str, engine: ocr.OcrEngine | None = None) -> dict:
         return _fallback_row(case_id)
 
 
+def _unread_inputs(ev: CaseEvidence) -> tuple[str, ...]:
+    """The decision-relevant inputs still unread, in gate order.
+
+    The escalation tier asks only "is anything unread" (_under_determined),
+    but MIB_TESSFT needs to know WHICH — it reads one label-anchored strip
+    per unread field rather than whole pages. Both callers share this one
+    definition so the gate and the strip list can never drift apart.
+    """
+    visa = ev.value("visa_class")
+    unread = []
+    if ev.value("fee_status") is None:
+        unread.append("fee_status")
+    if not ev.flags_known:
+        unread.append("risk_flags")
+    if not ev.arrival_on_intake:
+        unread.append("arrival_date")
+    if visa is None:
+        unread.append("visa_class")
+    if ev.value("home_world") is None:
+        unread.append("home_world")
+    if visa != "DIP-1" and ev.value("sponsor_id") is None:
+        unread.append("sponsor_id")
+    return tuple(unread)
+
+
 def _under_determined(ev: CaseEvidence) -> bool:
     """True when a decision-relevant input is still unread."""
-    visa = ev.value("visa_class")
-    return (
-        ev.value("fee_status") is None
-        or not ev.flags_known
-        or not ev.arrival_on_intake
-        or visa is None
-        or ev.value("home_world") is None
-        or (visa != "DIP-1" and ev.value("sponsor_id") is None)
-    )
+    return bool(_unread_inputs(ev))
 
 
 # --- A2: anchor-scored rotation probe (rot-probe-integrator) ---
@@ -275,10 +354,26 @@ def _userwords_enabled() -> bool:
     return _env_flag("MIB_USERWORDS", USERWORDS_DEFAULT)
 
 
+def _tessft_enabled() -> bool:
+    return _env_flag("MIB_TESSFT", TESSFT_DEFAULT)
+
+
 def _snapfix_enabled() -> bool:
     return _env_flag("MIB_SNAPFIX", SNAPFIX_DEFAULT)
 def _ctcfill_enabled() -> bool:
     return _env_flag("MIB_CTCFILL", CTCFILL_DEFAULT)
+
+
+def _rowrestore_enabled() -> bool:
+    return row_restore.enabled()
+
+
+def _absynth_enabled() -> bool:
+    return _env_flag("MIB_ABSYNTH", ABSYNTH_DEFAULT)
+
+
+def _xchannel_veto_enabled() -> bool:
+    return _env_flag("MIB_XCHANNEL_VETO", XCHANNEL_VETO_DEFAULT)
 
 
 def _strip_footer(text: str) -> str:
@@ -566,6 +661,39 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
             candidates, flag_candidates, findings = fields.collect_candidates(
                 pages, case_id)
             evidence = fields.reconcile(candidates, flag_candidates, findings)
+        # Fine-tuned-font pass (MIB_TESSFT=1, default OFF — flag unset keeps
+        # this block dead code, with no engine init and no OCR pass): re-read
+        # the value strips of the fields STILL UNREAD here with an LSTM
+        # fine-tuned on the generator's own font (ocr.tessft_lines). Same
+        # lazy gate as the variants above, so it never runs corpus-wide, and
+        # narrower still than the other tail blocks — it reads label-anchored
+        # strips for the unread fields only, not whole pages, which is what
+        # keeps it inside the s/PDF budget (cost note in ocr.py).
+        # Its lines are ADDITIVE: they pool by confidence against the page's
+        # existing lines (a stock read of the same row is never replaced,
+        # only voted with) and the block sits inside the escalation restore
+        # guard below, so it can fill a still-unread input but never
+        # out-vote an affirmative pre-escalation read.
+        if _tessft_enabled() and _under_determined(evidence) \
+                and _budget_left():
+            # Non-empty by construction: _under_determined IS this list
+            # being non-empty. 149 corpus packets carry no scan page at
+            # all; they never reach here, because the enclosing block
+            # already gated on `scans`.
+            unread = _unread_inputs(evidence)
+            for index, result in scans.items():
+                if not _budget_left():
+                    break
+                extra = ocr.tessft_lines(result, index, unread)
+                if not extra:
+                    continue
+                best = {" ".join(l.text.lower().split()): l
+                        for l in sorted(pages[index].lines + extra,
+                                        key=lambda l: l.conf)}
+                pages[index].lines = list(best.values())
+            candidates, flag_candidates, findings = fields.collect_candidates(
+                pages, case_id)
+            evidence = fields.reconcile(candidates, flag_candidates, findings)
         # --- CRNN block (crnn-integrator; weld edits go elsewhere) ---
         # Candidate-trained CRNN, last of all engines: it only sees pages
         # everything else failed on, and its lines carry tier1_ok=False so
@@ -661,6 +789,14 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
         rescued = _note_rescue_candidate(pages, scans, engine, _budget_left)
         if rescued is not None:
             evidence.template_finding = rescued
+    # Menu fills ctcfill actually applied, and the fields the pixel channel
+    # later withdrew. Both stay empty unless their flags are set, and both
+    # are shared with the ABSYNTH block: `absynth_cache` so a case that
+    # runs the veto and the fill pays for page registration once, `vetoed`
+    # so a withdrawn fill is never re-filled by the channel that withdrew it.
+    ctcfill_fills: dict[str, str] = {}
+    vetoed: set[str] = set()
+    absynth_cache = absynth.PageCache(case_id)
     # Closed-menu CTC fill (MIB_CTCFILL=1, default OFF — flag unset keeps
     # this block dead code): for the decision-relevant menu fields STILL
     # UNREAD after both engines, the whole escalation ladder AND its
@@ -696,6 +832,94 @@ def _process(pdf_path: str, engine: ocr.OcrEngine, case_id: str) -> dict:
                 if evidence.value(fld) is None:
                     evidence.values[fld] = value
                     evidence.conf[fld] = min(conf, ctcfill.CONF_CAP)
+                    ctcfill_fills[fld] = value
+    # Frame-registered closed-menu CTC fill (MIB_ROWRESTORE=1, default OFF
+    # — flag unset keeps this block dead code). Sibling of the CTCFILL
+    # block above and independent of its flag: for menu fields STILL
+    # UNREAD here, re-register each scan page's displaced band onto the
+    # form frame's fitted baseline and re-run the SAME closed-menu CTC
+    # scorer over it (ctcfill.fill_restored). A horizontally displaced
+    # band is a geometry defect the photometric ladder cannot undo, so
+    # those rows reach here unread with no word boxes; registration puts
+    # them back on the intake lattice the grid locator needs. Only rows
+    # the remap MOVED are eligible, so a fill here is attributable to the
+    # registration and not to ctcfill's ordinary reach. Fill-only and
+    # CONF_CAP'd by the same contract: `known` stays False, no hard-
+    # embargo world, no mode default, never fee_status or sponsor_id.
+    if scans and _rowrestore_enabled():
+        rowrestore_deadline = min(
+            started + ESCALATION_SOFT_BUDGET_SECONDS + ROWRESTORE_ALLOWANCE,
+            time.monotonic() + ROWRESTORE_ALLOWANCE)
+
+        def _rowrestore_left() -> bool:
+            return time.monotonic() < rowrestore_deadline
+
+        need = [f for f in ctcfill.FIELDS if evidence.value(f) is None]
+        if need and _rowrestore_left():
+            page_types = {i: pages[i].doc_type for i in scans}
+            for fld, (value, conf) in ctcfill.fill_restored(
+                    scans, need, budget_left=_rowrestore_left,
+                    page_types=page_types).items():
+                if evidence.value(fld) is None:
+                    evidence.values[fld] = value
+                    evidence.conf[fld] = min(conf, ctcfill.CONF_CAP)
+    # Cross-channel veto (MIB_XCHANNEL_VETO=1, default OFF — flag unset
+    # keeps this block dead code, independently of MIB_ABSYNTH). A menu
+    # fill is one witness; this asks the pixel channel the same question on
+    # the same row. Where it is confident AND decisively disagrees, the
+    # fill is withdrawn rather than corrected: the field returns to unread
+    # and the writer imputes, which is the state it would have had if
+    # ctcfill had abstained. Withdrawal-only by construction — the vetoed
+    # field is removed from `need` in the ABSYNTH block below, so this
+    # channel can never substitute the answer its own gate declined to
+    # publish. See absynth.VETO_MIN_ADVANTAGE for why the bar is set above
+    # the acceptance bar (vetoing a correct fill costs a full point;
+    # vetoing a wrong one gains only the chance the default is right).
+    if scans and ctcfill_fills and _xchannel_veto_enabled():
+        veto_deadline = time.monotonic() + ABSYNTH_ALLOWANCE
+        vetoed = absynth.veto(
+            scans, ctcfill_fills, case_id,
+            budget_left=lambda: time.monotonic() < veto_deadline,
+            page_types={i: pages[i].doc_type for i in scans},
+            cache=absynth_cache)
+        for fld in vetoed:
+            evidence.values.pop(fld, None)
+            evidence.conf.pop(fld, None)
+    # Generator-inversion menu read (MIB_ABSYNTH=1, default OFF — flag
+    # unset keeps this block dead code): the LAST resort, deliberately
+    # placed after the CTCFILL block so it only ever sees slots that
+    # survived every recognizer AND the CTC posterior channel. Those slots
+    # are precisely the ones writer.build_row would impute with
+    # writer._DEFAULTS, so the worst case of abstaining is the status quo.
+    # Instead of reading the strip, absynth.py re-renders each menu
+    # candidate on the generator's exact raster grid, degrades it with a
+    # kernel recovered from the row's OWN known label, and picks by NCC on
+    # a fixed common canvas — no recognizer, so destroyed strips that make
+    # the rec posteriors meaningless are still separable. Fill-only by
+    # construction (touches only fields whose value is None here), conf
+    # capped below the affirmative-read threshold so `known` stays False,
+    # never a hard-embargo world, never the writer's own mode default, and
+    # it abstains outright when the two registration anchors disagree or
+    # the row's damage sentinel outscores every menu value.
+    if scans and _absynth_enabled():
+        absynth_deadline = min(
+            started + ESCALATION_SOFT_BUDGET_SECONDS + CTCFILL_ALLOWANCE
+            + ABSYNTH_ALLOWANCE,
+            time.monotonic() + ABSYNTH_ALLOWANCE)
+
+        def _absynth_left() -> bool:
+            return time.monotonic() < absynth_deadline
+
+        need = [f for f in absynth.FIELDS
+                if evidence.value(f) is None and f not in vetoed]
+        if need and _absynth_left():
+            page_types = {i: pages[i].doc_type for i in scans}
+            for fld, (value, conf) in absynth.fill(
+                    scans, need, case_id, budget_left=_absynth_left,
+                    page_types=page_types, cache=absynth_cache).items():
+                if evidence.value(fld) is None:
+                    evidence.values[fld] = value
+                    evidence.conf[fld] = min(conf, absynth.CONF_CAP)
     # Name-challenge, AFTER the restore guard and for applicant_name only:
     # a grammar-valid CRNN name may replace a pre-known read ONLY when that
     # read fails the 12x24 name grammar (i.e. no engine produced a legal

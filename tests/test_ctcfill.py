@@ -302,6 +302,8 @@ class TestFillContract:
         assert ctcfill.fill({0: result}, ["home_world"]) == {}
 
     def test_cross_page_disagreement_abstains(self, monkeypatch):
+        # flag-off contract: fusion replaces this veto (test_ctcfill_fusion)
+        monkeypatch.delenv("MIB_CTCFILL_FUSION", raising=False)
         monkeypatch.setattr(ctcfill, "available", lambda: True)
         monkeypatch.setattr(ctcfill, "locate_strips",
                             lambda result, field: [("strip", "Home World:",
@@ -313,6 +315,8 @@ class TestFillContract:
         assert ctcfill.fill({0: 0, 1: 1}, ["home_world"]) == {}
 
     def test_agreeing_pages_fill_with_capped_conf(self, monkeypatch):
+        # patches _accept_strips, which the fused fill() bypasses
+        monkeypatch.delenv("MIB_CTCFILL_FUSION", raising=False)
         monkeypatch.setattr(ctcfill, "available", lambda: True)
         monkeypatch.setattr(ctcfill, "locate_strips",
                             lambda result, field: [("strip", "Home World:",
@@ -334,6 +338,8 @@ class TestFillContract:
         """A field the word-box path ACCEPTED never touches the grid; a
         field it did not accept falls through (one cached fit per
         page)."""
+        # patches _accept_strips, which the fused fill() bypasses
+        monkeypatch.delenv("MIB_CTCFILL_FUSION", raising=False)
         monkeypatch.setattr(ctcfill, "available", lambda: True)
         monkeypatch.setattr(
             ctcfill, "locate_strips",
